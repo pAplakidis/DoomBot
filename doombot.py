@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from concurrent.futures import process
 import vizdoom as vzd
 import os
 import random
@@ -7,6 +8,7 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import itertools as it
+import skimage.transform
 from time import time, sleep
 from tqdm import trange
 from collections import deque
@@ -25,7 +27,7 @@ else:
   print("[+] Using CPU")
 
 config_file_path = os.path.join(vzd.scenarios_path, "simpler_basic.cfg")
-model_path = "models/doom_guy.pth"
+model_path = "models/doomguy.pth"
 save_model = True
 
 replay_memory_size = 10000
@@ -34,13 +36,16 @@ load_model = False
 
 learning_rate = 1e-4
 batch_size = 64
-resolution = (128, 128)
+#resolution = (128, 128)
+resolution = (30, 45)
 n_epochs = 100
 
 frame_repeat = 12
 learning_steps_per_epoch = 2000
 
-
+skip_learning = False
+test_episodes_per_epoch = 100
+episodes_to_watch = 10
 
 class DQN(nn.Module):
   def __init__(self, n_avail_actions):
@@ -111,11 +116,15 @@ class DoomGuyAgent:
     self.criterion = nn.MSELoss()
 
     if load_model:
-      pass
+      self.q_net = torch.load(model_path)
+      self.target_net = torch.load(model_path)
+      self.epsilon = epsilon_min
     else:
       print("[+] Creating New Deep Learning Model ...")
       self.q_net = DQN(action_size).to(DEVICE)
       self.target_net = DQN(action_size).to(DEVICE)
+
+    self.opt = optim.SGD(self.q_net.parameters(), lr=self.lr)
 
   def get_action(self, state):
     if np.random.uniform() < self.epsilon:
@@ -178,7 +187,7 @@ def game_init():
   print("[+] Initializing Doom ...")
   game = vzd.DoomGame()
   game.load_config(config_file_path)
-  game.set_window_visible(True)
+  game.set_window_visible(False)
   game.set_mode(vzd.Mode.PLAYER)
   game.set_screen_format(vzd.ScreenFormat.GRAY8)
   game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
@@ -187,55 +196,74 @@ def game_init():
   return game
 
 def process_frame(img):
-  img = cv2.resize(img, resolution)
+  #img = cv2.resize(img, resolution)
+  img = skimage.transform.resize(img, resolution)
   img = img.astype(np.float32)
   img = np.expand_dims(img, axis=0)
   return img
 
 def test(game, agent):
-  pass
+  print("Testing Agent ...")
+  test_scores = []
+  for test_episode in (t := trange(test_episodes_per_epoch)):
+    game.new_episode()
+    while not game.is_episode_finished():
+      state = process_frame(game.get_state().screen_buffer)
+      best_action_idx = agent.get_action(state)
+      game.make_action(actions[best_action_idx], frame_repeat)
+
+    r = game.get_total_reward()
+    test_scores.append(r)
+
+  test_scores = np.array(test_scores)
+  print("Test Results: mean %.1f +/- %.1f, min: %.1f, max: %.1f"%(test_scores.mean(), test_scores.std(), test_scores.min(), test_scores.max()))
 
 def run(game, agent, actions, n_epochs, frame_repeat, steps_per_epoch=2000):
   # for each epoch, for each episode, skip frame_repeat number of frames after each action
   start_time = time()
 
-  for epoch in range(n_epochs):
-    game.new_episode()
-    train_scores = []
-    global_step = 0
-    print("[+] Epoch %d"%(epoch+1))
+  try:
+    for epoch in range(n_epochs):
+      game.new_episode()
+      train_scores = []
+      global_step = 0
+      print("[+] Epoch %d"%(epoch+1))
 
-    for i in (t := trange(steps_per_epoch, leave=False)):
-      state = process_frame(game.get_state().screen_buffer)
-      action = agent.get_action(state)
-      reward = game.make_action(actions[action], frame_repeat)
-      done = game.is_episode_finished()
+      for i in (t := trange(steps_per_epoch)):
+        state = process_frame(game.get_state().screen_buffer)
+        action = agent.get_action(state)
+        reward = game.make_action(actions[action], frame_repeat)
+        done = game.is_episode_finished()
 
-      if not done:
-        next_state = process_frame(game.get_state().screen_buffer)
-      else:
-        next_state = np.zeros((1, resolution[0], resolution[1]))
-      
-      agent.append_memory(state, action, reward, next_state, done)
+        if not done:
+          next_state = process_frame(game.get_state().screen_buffer)
+        else:
+          next_state = np.zeros((1, resolution[0], resolution[1]))
+        
+        agent.append_memory(state, action, reward, next_state, done)
 
-      if global_step > agent.batch_size:
-        agent.train()
-      
-      if done:
-        train_scores.append(game.get_total_reward())
-        game.new_episode()
+        if global_step > agent.batch_size:
+          agent.train()
+        
+        if done:
+          train_scores.append(game.get_total_reward())
+          game.new_episode()
 
-      global_step += 1
-    agent.update_target_net()
-    train_scores = np.array(train_scores)
-    print("Results: mean: %.1f +/- %.1f,"%(train_scores.mean(), train_scores.std()),
-          "min %.1f,"%train_scores.min(), "max: %.1f"%train_scores.max())
+        global_step += 1
+      agent.update_target_net()
+      train_scores = np.array(train_scores)
+      print("Train Results: mean: %.1f +/- %.1f,"%(train_scores.mean(), train_scores.std()),
+            "min %.1f,"%train_scores.min(), "max: %.1f"%train_scores.max())
 
-    test(game, agent)
-    if save_model:
-      print("[+] Saving model to:", model_path)
-      torch.save(agent.q_net, model_path)
-    print("Time elapsed: %.2f minutes"%((time() - start_time) / 60.0))
+      test(game, agent)
+      if save_model:
+        print("Saving model to:", model_path)
+        torch.save(agent.q_net, model_path)
+      print("Total time elapsed: %.2f minutes"%((time() - start_time) / 60.0))
+  except KeyboardInterrupt:
+    print("[-] Training was interrupted by user")
+    print("[+] Saving model to:", model_path)
+    torch.save(agent.q_net, model_path)
   
   game.close()
   return agent, game
@@ -249,9 +277,29 @@ if __name__ == '__main__':
   agent = DoomGuyAgent(len(actions), lr=learning_rate, batch_size=batch_size,
                       memory_size=replay_memory_size, discount_factor=discount_factor,
                       load_model=load_model)
-  print("[+] Training Agent ...")
-  agent, game = run(game, agent, actions, n_epochs=n_epochs, frame_repeat=frame_repeat,
-                    steps_per_epoch=learning_steps_per_epoch)
-  print("[+] Training Done!")
+  if not skip_learning:
+    print("[+] Training Agent ...")
+    agent, game = run(game, agent, actions, n_epochs=n_epochs, frame_repeat=frame_repeat,
+                      steps_per_epoch=learning_steps_per_epoch)
+    print("[+] Training Done!")
   
+  print("[+] Agent's live gameplay ...")
   game.close()
+  game.set_window_visible(True)
+  game.set_mode(vzd.Mode.ASYNC_PLAYER)
+  game.init()
+
+  for e in range(episodes_to_watch):
+    game.new_episode()
+    while not game.is_episode_finished():
+      state = process_frame(game.get_state().screen_buffer)
+      best_action_idx = agent.get_action(state)
+
+      # This makes the animation smoother when compared to make_action()
+      game.set_action(actions[best_action_idx])
+      for i in range(frame_repeat):
+        game.advance_action()
+
+    sleep(1.0)
+    score = game.get_total_reward()
+    print("Total score: ", score)
